@@ -1,0 +1,71 @@
+metadata:
+  name: aws_self_healing_graph
+  version: "1.0"
+  description: LangGraph workflow for AWS self-healing orchestration with Claude validation.
+
+nodes:
+  - id: start
+    type: start
+    description: Entry point for the workflow.
+
+  - id: validate_aws_credentials
+    type: task
+    description: Validate AWS credentials using STS GetCallerIdentity.
+
+  - id: list_s3
+    type: task
+    description: Query all S3 buckets.
+
+  - id: claude_analyze
+    type: task
+    description: Claude-based analysis on AWS state and S3 inventory.
+
+  - id: provision_langgraph
+    type: task
+    description: Deploy and provision LangGraph runtime and supporting modules.
+
+  - id: recover_failure
+    type: task
+    description: Self-healing node using Claude to suggest fixes and retry logic.
+
+  - id: success
+    type: end
+    description: Workflow completed successfully.
+
+  - id: failure
+    type: end
+    description: Workflow ended with unrecoverable error.
+
+edges:
+  - source: start
+    target: validate_aws_credentials
+
+  - source: validate_aws_credentials
+    target: list_s3
+    condition: credentials.valid == true
+
+  - source: validate_aws_credentials
+    target: recover_failure
+    condition: credentials.valid == false
+
+  - source: list_s3
+    target: claude_analyze
+
+  - source: claude_analyze
+    target: provision_langgraph
+
+  - source: provision_langgraph
+    target: success
+    condition: provisioning.success == true
+
+  - source: provision_langgraph
+    target: recover_failure
+    condition: provisioning.success == false
+
+  - source: recover_failure
+    target: success
+    condition: recovery.success == true
+
+  - source: recover_failure
+    target: failure
+    condition: recovery.success == false
