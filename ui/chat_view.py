@@ -8,138 +8,137 @@ from services.terraform_exec import run_terraform
 
 def render_chat_section(region: str):
 
-    st.subheader("2️⃣ Chat with Claude (with optional Terraform provisioning)")
+    st.subheader("💬 Claude Chat + Self-Healing Terraform Agent")
 
-    # ---------------------------------------------------------------------
-    # Initialize persistent session state values
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Init session state
+    # -------------------------------------------------------------------------
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    if "last_tf_code" not in st.session_state:
-        st.session_state.last_tf_code = None
-    if "last_tf_stdout" not in st.session_state:
-        st.session_state.last_tf_stdout = None
-    if "last_tf_stderr" not in st.session_state:
-        st.session_state.last_tf_stderr = None
-    if "last_tf_file" not in st.session_state:
-        st.session_state.last_tf_file = None
+    if "tf_heal_results" not in st.session_state:
+        st.session_state.tf_heal_results = None
 
-    # ---------------------------------------------------------------------
-    # Render chat history
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Display chat history
+    # -------------------------------------------------------------------------
     for msg in st.session_state.chat_history:
         role = msg["role"]
-        content = msg["content"]
-
-        if role == "user":
-            st.markdown(f"**You:** {content}")
-        else:
-            st.markdown(f"**Claude:** {content}")
+        st.markdown(f"**{role.capitalize()}:** {msg['content']}")
 
     st.markdown("---")
 
-    # ---------------------------------------------------------------------
-    # Chat input widgets
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Chat input section
+    # -------------------------------------------------------------------------
     user_prompt = st.text_area(
         "Type your request:",
-        key="chat_input",
-        height=100,
-        placeholder="e.g. 'Create an S3 bucket with versioning using Terraform'",
+        height=120,
+        placeholder="e.g. Deploy an S3 bucket with versioning using Terraform"
     )
 
     trigger_tf = st.checkbox(
-        "Trigger Terraform provisioning from this prompt?",
+        "Trigger Self-Healing Terraform agent?",
         value=False,
-        help="If checked, Claude will generate Terraform code and terraform init/apply will run automatically."
+        help="Claude will generate Terraform, validate it, self-heal errors, and apply infra automatically."
     )
 
-    # ---------------------------------------------------------------------
-    # Chat Form (fixes Streamlit button reliability)
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Chat submit button
+    # -------------------------------------------------------------------------
     with st.form("chat_form", clear_on_submit=True):
         submitted = st.form_submit_button("💬 Ask Claude")
 
         if submitted:
-
             if not user_prompt.strip():
                 st.warning("Please enter a prompt.")
                 return
 
-            # Save user message
-            st.session_state.chat_history.append({
-                "role": "user",
-                "content": user_prompt
-            })
+            # Save chat
+            st.session_state.chat_history.append({"role": "user", "content": user_prompt})
 
-            # -----------------------------------------------------------------
-            # 1️⃣ Claude response
-            # -----------------------------------------------------------------
+            # Claude response
             with st.spinner("Claude is thinking..."):
-                try:
-                    answer = call_claude(region, user_prompt, max_tokens=500)
-                except Exception as e:
-                    answer = f"⚠️ Claude call failed: {e}"
+                answer = call_claude(region, user_prompt, max_tokens=500)
 
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": answer
-            })
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
             # -----------------------------------------------------------------
-            # 2️⃣ Terraform generation + execution (if checkbox enabled)
+            # Self-healing Terraform pipeline
             # -----------------------------------------------------------------
             if trigger_tf:
-
-                # Generate clean Terraform from Claude
-                with st.spinner("Generating Terraform from Claude..."):
+                with st.spinner("Generating Terraform (Claude)…"):
                     tf_code = generate_terraform(region, user_prompt)
 
-                st.session_state.last_tf_code = tf_code
+                with st.spinner("Running Self-Healing Terraform…"):
+                    results = run_terraform(tf_code)
 
-                # Run Terraform
-                with st.spinner("Running terraform init/apply..."):
-                    stdout, stderr, tf_file_path = run_terraform(tf_code)
+                st.session_state.tf_heal_results = results
 
-                st.session_state.last_tf_stdout = stdout
-                st.session_state.last_tf_stderr = stderr
-                st.session_state.last_tf_file = tf_file_path
-
-            # Rerun UI
             st.experimental_rerun()
 
-    # ---------------------------------------------------------------------
-    # Terraform results section
-    # ---------------------------------------------------------------------
-    if st.session_state.last_tf_code:
-        st.markdown("### 🧩 Terraform Code (main.tf)")
-        with st.expander("Show Terraform File", expanded=False):
-            st.code(st.session_state.last_tf_code, language="hcl")
+    # -------------------------------------------------------------------------
+    # Display Self-Healing Terraform Results
+    # -------------------------------------------------------------------------
+    if st.session_state.tf_heal_results:
 
-        # Download button
-        if st.session_state.last_tf_file:
+        results = st.session_state.tf_heal_results
+
+        st.markdown("## 🤖 Self-Healing Terraform Results")
+
+        if results["success"]:
+            st.success("Terraform applied successfully after self-healing!")
+        else:
+            st.error("Terraform failed after all healing attempts.")
+
+        # Downloadable TF code
+        if results["tf_file"]:
             try:
-                with open(st.session_state.last_tf_file, "rb") as f:
+                with open(results["tf_file"], "rb") as f:
                     st.download_button(
-                        label="⬇ Download main.tf",
-                        data=f,
+                        "⬇ Download Final main.tf",
+                        f,
                         file_name="main.tf",
-                        mime="text/plain",
+                        mime="text/plain"
                     )
             except:
-                st.warning("Could not load generated Terraform file.")
+                st.warning("Could not load final Terraform file.")
 
-    # ---------------------------------------------------------------------
-    # Terraform execution output
-    # ---------------------------------------------------------------------
-    if st.session_state.last_tf_stdout or st.session_state.last_tf_stderr:
-        st.markdown("### 🛠 Terraform Execution Output")
+        st.markdown("### 🔍 Healing Attempts")
+        attempts = results["attempts"]
 
-        if st.session_state.last_tf_stdout:
-            st.markdown("**STDOUT:**")
-            st.code(st.session_state.last_tf_stdout, language="bash")
+        # ---------------------------------------------------------------------
+        # Loop through attempts
+        # ---------------------------------------------------------------------
+        for idx, att in enumerate(attempts, start=1):
+            stage = att["stage"]
+            success = att["success"]
+            stdout = att["stdout"]
+            stderr = att["stderr"]
+            tf_code = att["tf"]
 
-        if st.session_state.last_tf_stderr:
-            st.markdown("**STDERR:**")
-            st.code(st.session_state.last_tf_stderr, language="bash")
+            st.markdown(f"---\n## 🩺 Healing Attempt #{idx}")
+
+            # Attempt status
+            if success:
+                st.success(f"Attempt #{idx}: SUCCESS at stage `{stage}` 🎉")
+            else:
+                st.error(f"Attempt #{idx}: FAILED at stage `{stage}`")
+
+            st.markdown("### 🧩 Terraform Code Used in This Attempt")
+            with st.expander("Show Terraform (attempt version)", expanded=False):
+                st.code(tf_code, language="hcl")
+
+            # Logs
+            st.markdown("### 📄 STDOUT")
+            st.code(stdout or "(empty)")
+
+            if stderr:
+                st.markdown("### ⚠️ STDERR")
+                st.code(stderr)
+
+            # If failure → show healing context
+            if not success and idx != len(attempts):
+                st.info("Claude attempted to repair the Terraform code for the next retry.")
+
+    st.markdown("---")
