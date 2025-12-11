@@ -1,3 +1,4 @@
+
 # services/terraform_exec.py
 
 import subprocess
@@ -12,12 +13,15 @@ from services.terraform_cleaner import clean_terraform_code
 from services.bedrock import call_claude
 from services.logger import get_logger
 
+# Agentic helpers
+from services.langgraph import build_default_terraform_graph, execute_graph
+
 logger = get_logger()
 
 GENERATED_DIR = Path("generated")
 GENERATED_DIR.mkdir(exist_ok=True)
 
-MAX_HEALING_ATTEMPTS = 3
+MAX_HEALING_ATTEMPTS = 6
 
 
 # ---------------------------------------------------------------------
@@ -86,94 +90,76 @@ def run_stage(cmd, cwd, env, stage_name, tf_code):
     logger.debug(f"{stage_name} STDOUT:\n{stdout}")
     logger.debug(f"{stage_name} STDERR:\n{stderr}")
 
+    # Normalize for UI: always expose 'tf'
     return {
         "stage": stage_name,
         "success": ok,
         "stdout": stdout,
         "stderr": stderr,
-        "tf_code": tf_code
+        "tf": tf_code
     }
 
 
 # ========================================================================================
-# 🔥 LANGGRAPH TOOL — run_terraform_once (init only once, plan/apply always)
+#  LANGGRAPH CALLBACKS — per-stage functions (init/plan/apply/heal)
 # ========================================================================================
-def run_terraform_once(tf_code: str):
+def make_callbacks(workdir: Path, env: dict):
     """
-    New behavior:
-    - init runs ONLY ONE TIME per session
-    - plan/apply run on every retry
-    - if apply fails, retry starts at plan
-    - if plan fails, retry starts at plan
+    Creates node callbacks bound to a working directory and environment.
+    Each callback reads/writes `context["tf"]`.
     """
 
-    terraform_bin = find_terraform_binary()
-    if not terraform_bin:
-        terraform_bin = auto_install_terraform()
-        st.session_state["terraform_path_override"] = terraform_bin
-
-    env = os.environ.copy()
-    env["AWS_ACCESS_KEY_ID"] = st.session_state.get("aws_access_key", "")
-    env["AWS_SECRET_ACCESS_KEY"] = st.session_state.get("aws_secret_key", "")
-    env["AWS_DEFAULT_REGION"] = st.session_state.get("aws_region", "us-east-1")
-
-    # Track whether init already executed
-    init_done = st.session_state.get("terraform_init_done", False)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tf_file = Path(tmp, "main.tf")
+    def init_cb(context):
+        tf_code = context.get("tf", "")
+        tf_file = Path(workdir, "main.tf")
         tf_file.write_text(tf_code, encoding="utf-8")
 
-        # ----------------------------------------------------
-        # INIT: Only run on first attempt
-        # ----------------------------------------------------
-        if not init_done:
-            init_result = run_stage(
-                [terraform_bin, "init", "-input=false"],
-                tmp,
-                env,
-                "init",
-                tf_code,
-            )
-            if not init_result["success"]:
-                return init_result
+        init_done = st.session_state.get("terraform_init_done", False)
+        if init_done:
+            logger.info("Terraform init previously completed. Skipping init stage.")
+            return {
+                "stage": "init",
+                "success": True,
+                "stdout": "Init skipped (already done in this session).",
+                "stderr": "",
+                "tf": tf_code
+            }
 
+        terraform_bin = st.session_state.get("terraform_path_override")
+        if not terraform_bin:
+            terraform_bin = find_terraform_binary() or auto_install_terraform()
+            st.session_state["terraform_path_override"] = terraform_bin
+
+        result = run_stage([terraform_bin, "init", "-input=false"], workdir, env, "init", tf_code)
+        if result["success"]:
             st.session_state["terraform_init_done"] = True
-            logger.info("Terraform init completed (will not run again).")
+            logger.info("Terraform init completed (will not run again this session).")
+        return result
 
-        # ----------------------------------------------------
-        # PLAN: Always run before apply
-        # ----------------------------------------------------
-        plan_result = run_stage(
-            [terraform_bin, "plan", "-input=false"],
-            tmp,
-            env,
-            "plan",
-            tf_code,
-        )
-        if not plan_result["success"]:
-            return plan_result  # healing → retry from plan
+    def plan_cb(context):
+        tf_code = context.get("tf", "")
+        Path(workdir, "main.tf").write_text(tf_code, encoding="utf-8")
+        terraform_bin = st.session_state.get("terraform_path_override") or find_terraform_binary() or auto_install_terraform()
+        st.session_state["terraform_path_override"] = terraform_bin
+        return run_stage([terraform_bin, "plan", "-input=false"], workdir, env, "plan", tf_code)
 
-        # ----------------------------------------------------
-        # APPLY
-        # ----------------------------------------------------
-        apply_result = run_stage(
-            [terraform_bin, "apply", "-auto-approve", "-input=false"],
-            tmp,
-            env,
-            "apply",
-            tf_code,
-        )
-        return apply_result
+    def apply_cb(context):
+        tf_code = context.get("tf", "")
+        Path(workdir, "main.tf").write_text(tf_code, encoding="utf-8")
+        terraform_bin = st.session_state.get("terraform_path_override") or find_terraform_binary() or auto_install_terraform()
+        st.session_state["terraform_path_override"] = terraform_bin
+        return run_stage([terraform_bin, "apply", "-auto-approve", "-input=false"], workdir, env, "apply", tf_code)
 
+    def heal_cb(context):
+        tf_code = context.get("tf", "")
+        last_attempt = context.get("last_attempt") or {}
+        stage = last_attempt.get("stage", "unknown")
+        stderr = last_attempt.get("stderr", "")
+        stdout = last_attempt.get("stdout", "")
 
-# ========================================================================================
-# 🔥 LANGGRAPH TOOL — heal_terraform
-# ========================================================================================
-def heal_terraform(tf_code: str, stage: str, stderr: str, stdout: str):
-    logger.warning(f"Terraform failed during {stage}. Healing code...")
+        logger.warning(f"Terraform failed during {stage}. Healing code...")
 
-    healing_prompt = f"""
+        healing_prompt = f"""
 You are a Terraform and AWS specialist.
 Fix ONLY the Terraform HCL.
 
@@ -196,60 +182,80 @@ Current Terraform code:
 
 Fix EVERYTHING required for terraform init/plan/apply to succeed.
 """
+        healed = call_claude(st.session_state.aws_region, healing_prompt, max_tokens=2000)
+        cleaned = clean_terraform_code(healed)
 
-    healed = call_claude(st.session_state.aws_region, healing_prompt, max_tokens=2000)
-    cleaned = clean_terraform_code(healed)
+        logger.info("Claude returned healed Terraform code.")
+        logger.debug(f"Healed Terraform:\n{cleaned}")
 
-    logger.info("Claude returned healed Terraform code.")
-    logger.debug(f"Healed Terraform:\n{cleaned}")
+        return {
+            "stage": "heal",
+            "success": True,
+            "stdout": "Terraform code healed by Claude",
+            "stderr": "",
+            "tf": cleaned
+        }
 
-    return cleaned
+    return {
+        "init": init_cb,
+        "plan": plan_cb,
+        "apply": apply_cb,
+        "heal": heal_cb
+    }
 
 
 # ========================================================================================
-# 🔥 High-level Streamlit Wrapper (auto-heal loop)
+#  High-level Streamlit Wrapper (agentic, graph-driven)
 # ========================================================================================
-def run_terraform(tf_code: str):
-    logger.info("Starting self-healing Terraform pipeline...")
+def run_terraform(tf_code: str, graph: dict = None):
+    logger.info("Starting agentic (graph-driven) Terraform pipeline...")
     save_tf_file(tf_code)
 
     terraform_bin = find_terraform_binary() or auto_install_terraform()
     st.session_state["terraform_path_override"] = terraform_bin
 
-    # Reset init flag for new full run
+    # Reset init flag for a new full run
     st.session_state["terraform_init_done"] = False
 
-    attempts = []
-    current_tf = tf_code
+    # Build env for Terraform
+    env = os.environ.copy()
+    env["AWS_ACCESS_KEY_ID"] = st.session_state.get("aws_access_key", "")
+    env["AWS_SECRET_ACCESS_KEY"] = st.session_state.get("aws_secret_key", "")
+    env["AWS_DEFAULT_REGION"] = st.session_state.get("aws_region", "us-east-1")
 
-    for attempt in range(1, MAX_HEALING_ATTEMPTS + 1):
-        logger.info(f"=== Attempt {attempt}/{MAX_HEALING_ATTEMPTS} ===")
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp)
 
-        result = run_terraform_once(current_tf)
-        attempts.append(result)
+        # Graph selection: prefer uploaded graph in session, else arg, else default
+        user_graph = graph or st.session_state.get("langgraph_def") or build_default_terraform_graph()
+        attempt_cap = user_graph.get("metadata", {}).get("max_attempts", MAX_HEALING_ATTEMPTS)
 
-        if result["success"]:
-            logger.info("Terraform successfully applied.")
-            final = save_tf_file(current_tf)
-            return {
-                "success": True,
-                "attempts": attempts,
-                "tf_file": str(final)
-            }
+        callbacks = make_callbacks(workdir, env)
 
-        # Heal
-        current_tf = heal_terraform(
-            current_tf,
-            result["stage"],
-            result["stderr"],
-            result["stdout"]
+        context = {
+            "tf": tf_code,
+            "aws_region": st.session_state.get("aws_region", "us-east-1"),
+            "last_attempt": None
+        }
+
+        exec_result = execute_graph(
+            region=st.session_state.get("aws_region", "us-east-1"),
+            graph=user_graph,
+            callbacks=callbacks,
+            initial_context=context,
+            attempt_limit=attempt_cap
         )
 
-    logger.error("Terraform failed even after all healing cycles.")
-    final = save_tf_file(current_tf)
+        attempts = exec_result.get("attempts", [])
+        success = exec_result.get("success", False)
 
-    return {
-        "success": False,
-        "attempts": attempts,
-        "tf_file": str(final)
-    }
+        final_tf = context.get("tf", tf_code)
+        final_path = save_tf_file(final_tf)
+
+        return {
+            "success": success,
+            "attempts": attempts,
+            "tf_file": str(final_path),
+            "graph_used": user_graph.get("metadata", {}).get("name", "TerraformSelfHealing"),
+            "error": exec_result.get("error")
+        }
