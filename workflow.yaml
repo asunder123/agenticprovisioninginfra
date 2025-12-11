@@ -1,71 +1,135 @@
 metadata:
-  name: aws_self_healing_graph
-  version: "1.0"
-  description: LangGraph workflow for AWS self-healing orchestration with Claude validation.
+  name: self_healing_terraform_agent
+  version: "1.0.0"
+  author: "Your Name"
+  description: "A LangGraph workflow for autonomous, self-healing Terraform execution using Claude."
+
+
+version: 1
+description: >
+  Self-Healing Terraform Agent powered by LangGraph.
+  This workflow:
+    1. Generates Terraform code from user prompt.
+    2. Runs Terraform init/plan/apply once.
+    3. If failure, uses Claude to repair the code.
+    4. Retries until success or max attempts.
+    5. Returns final Terraform result + all attempts.
+
+states:
+  input:
+    type: object
+    required: [prompt]
+    properties:
+      prompt:
+        type: string
+        description: User's natural-language request for provisioning.
+
+  terraform_code:
+    type: object
+    properties:
+      tf_code:
+        type: string
+
+  execution_result:
+    type: object
+    properties:
+      stage:
+        type: string
+      success:
+        type: boolean
+      stdout:
+        type: string
+      stderr:
+        type: string
+      tf_code:
+        type: string
+
+  healed_code:
+    type: object
+    properties:
+      tf_code:
+        type: string
+
+  final:
+    type: object
+    properties:
+      success:
+        type: boolean
+      attempts:
+        type: array
+        items:
+          type: object
+      tf_final:
+        type: string
 
 nodes:
-  - id: start
-    type: start
-    description: Entry point for the workflow.
+  generate_tf:
+    type: llm
+    model: claude-3-5-sonnet
+    input: |
+      You are an AWS Terraform expert.
+      Convert the user request below into VALID Terraform HCL.
 
-  - id: validate_aws_credentials
-    type: task
-    description: Validate AWS credentials using STS GetCallerIdentity.
+      NO explanations.
+      NO markdown.
+      NO backticks.
+      Return ONLY the Terraform configuration.
 
-  - id: list_s3
-    type: task
-    description: Query all S3 buckets.
+      User request:
+      {{input.prompt}}
+    output: |
+      { "tf_code": "{{response}}" }
 
-  - id: claude_analyze
-    type: task
-    description: Claude-based analysis on AWS state and S3 inventory.
+  run_tf:
+    type: python
+    path: services/terraform_exec.py
+    function: run_terraform_once
+    input_mapping:
+      tf_code: terraform_code.tf_code
+    output_mapping:
+      stage: stage
+      success: success
+      stdout: stdout
+      stderr: stderr
+      tf_code: tf_code
 
-  - id: provision_langgraph
-    type: task
-    description: Deploy and provision LangGraph runtime and supporting modules.
-
-  - id: recover_failure
-    type: task
-    description: Self-healing node using Claude to suggest fixes and retry logic.
-
-  - id: success
-    type: end
-    description: Workflow completed successfully.
-
-  - id: failure
-    type: end
-    description: Workflow ended with unrecoverable error.
+  heal_tf:
+    type: python
+    path: services/terraform_exec.py
+    function: heal_terraform
+    input_mapping:
+      tf_code: execution_result.tf_code
+      stage: execution_result.stage
+      stderr: execution_result.stderr
+      stdout: execution_result.stdout
+    output_mapping:
+      tf_code: tf_code
 
 edges:
-  - source: start
-    target: validate_aws_credentials
+  - from: input
+    to: generate_tf
+    map_result_to: terraform_code
 
-  - source: validate_aws_credentials
-    target: list_s3
-    condition: credentials.valid == true
+  - from: generate_tf
+    to: run_tf
+    map_result_to: execution_result
 
-  - source: validate_aws_credentials
-    target: recover_failure
-    condition: credentials.valid == false
+  - condition: "{{execution_result.success == false}}"
+    from: run_tf
+    to: heal_tf
+    map_result_to: healed_code
 
-  - source: list_s3
-    target: claude_analyze
+  - condition: "{{execution_result.success == false}}"
+    from: heal_tf
+    to: run_tf
+    map:
+      terraform_code.tf_code: healed_code.tf_code
 
-  - source: claude_analyze
-    target: provision_langgraph
+  - condition: "{{execution_result.success == true}}"
+    from: run_tf
+    to: final
+    map_result_to: final
 
-  - source: provision_langgraph
-    target: success
-    condition: provisioning.success == true
-
-  - source: provision_langgraph
-    target: recover_failure
-    condition: provisioning.success == false
-
-  - source: recover_failure
-    target: success
-    condition: recovery.success == true
-
-  - source: recover_failure
-    target: failure
-    condition: recovery.success == false
+limits:
+  max_retries: 3
+  stop_after_success: true

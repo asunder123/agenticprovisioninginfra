@@ -1,5 +1,7 @@
+
 # ui/chat_view.py
 
+import os
 import streamlit as st
 from services.bedrock import call_claude
 from services.terraform_gen import generate_terraform
@@ -23,8 +25,9 @@ def render_chat_section(region: str):
     # Display chat history
     # -------------------------------------------------------------------------
     for msg in st.session_state.chat_history:
-        role = msg["role"]
-        st.markdown(f"**{role.capitalize()}:** {msg['content']}")
+        role = msg.get("role", "assistant")
+        content = msg.get("content", "")
+        st.markdown(f"**{role.capitalize()}:** {content}")
 
     st.markdown("---")
 
@@ -50,7 +53,7 @@ def render_chat_section(region: str):
         submitted = st.form_submit_button("💬 Ask Claude")
 
         if submitted:
-            if not user_prompt.strip():
+            if not (user_prompt or "").strip():
                 st.warning("Please enter a prompt.")
                 return
 
@@ -58,8 +61,11 @@ def render_chat_section(region: str):
             st.session_state.chat_history.append({"role": "user", "content": user_prompt})
 
             # Claude response
-            with st.spinner("Claude is thinking..."):
-                answer = call_claude(region, user_prompt, max_tokens=500)
+            try:
+                with st.spinner("Claude is thinking..."):
+                    answer = call_claude(region, user_prompt, max_tokens=500)
+            except Exception as e:
+                answer = f"Sorry, Claude could not process the request. Error: {e}"
 
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
@@ -67,11 +73,21 @@ def render_chat_section(region: str):
             # Self-healing Terraform pipeline
             # -----------------------------------------------------------------
             if trigger_tf:
-                with st.spinner("Generating Terraform (Claude)…"):
-                    tf_code = generate_terraform(region, user_prompt)
+                try:
+                    with st.spinner("Generating Terraform (Claude)…"):
+                        tf_code = generate_terraform(region, user_prompt)
+                except Exception as e:
+                    tf_code = None
+                    st.error(f"Terraform generation failed: {e}")
 
-                with st.spinner("Running Self-Healing Terraform…"):
-                    results = run_terraform(tf_code)
+                try:
+                    if tf_code is not None:
+                        with st.spinner("Running Self-Healing Terraform…"):
+                            results = run_terraform(tf_code)
+                    else:
+                        results = {"success": False, "attempts": [], "error": "No Terraform code generated."}
+                except Exception as e:
+                    results = {"success": False, "attempts": [], "error": f"Terraform execution failed: {e}"}
 
                 st.session_state.tf_heal_results = results
 
@@ -80,65 +96,80 @@ def render_chat_section(region: str):
     # -------------------------------------------------------------------------
     # Display Self-Healing Terraform Results
     # -------------------------------------------------------------------------
-    if st.session_state.tf_heal_results:
-
-        results = st.session_state.tf_heal_results
-
+    results = st.session_state.tf_heal_results
+    if isinstance(results, dict) and results:
         st.markdown("## 🤖 Self-Healing Terraform Results")
 
-        if results["success"]:
+        # Overall success/failure
+        if results.get("success", False):
             st.success("Terraform applied successfully after self-healing!")
         else:
             st.error("Terraform failed after all healing attempts.")
+            if results.get("error"):
+                st.warning(f"Pipeline error: {results['error']}")
 
-        # Downloadable TF code
-        if results["tf_file"]:
+        # Downloadable TF code (final)
+        tf_file = results.get("tf_file")
+        if tf_file:
             try:
-                with open(results["tf_file"], "rb") as f:
-                    st.download_button(
-                        "⬇ Download Final main.tf",
-                        f,
-                        file_name="main.tf",
-                        mime="text/plain"
-                    )
-            except:
-                st.warning("Could not load final Terraform file.")
+                if os.path.exists(tf_file):
+                    with open(tf_file, "rb") as f:
+                        st.download_button(
+                            "⬇ Download Final main.tf",
+                            f,
+                            file_name="main.tf",
+                            mime="text/plain"
+                        )
+                else:
+                    st.warning(f"Terraform file not found at: {tf_file}")
+            except Exception as e:
+                st.warning(f"Could not load final Terraform file: {e}")
 
         st.markdown("### 🔍 Healing Attempts")
-        attempts = results["attempts"]
+        attempts = results.get("attempts") or []
 
-        # ---------------------------------------------------------------------
-        # Loop through attempts
-        # ---------------------------------------------------------------------
-        for idx, att in enumerate(attempts, start=1):
-            stage = att["stage"]
-            success = att["success"]
-            stdout = att["stdout"]
-            stderr = att["stderr"]
-            tf_code = att["tf"]
+        if not attempts:
+            st.info("No healing attempts were recorded.")
+        else:
+            # -----------------------------------------------------------------
+            # Loop through attempts safely
+            # -----------------------------------------------------------------
+            for idx, att in enumerate(attempts, start=1):
+                # Safe extraction with defaults
+                stage = att.get("stage", "unknown")
+                success = bool(att.get("success", False))
+                stdout = att.get("stdout") or ""
+                stderr = att.get("stderr") or ""
 
-            st.markdown(f"---\n## 🩺 Healing Attempt #{idx}")
+                # 'tf' key might be missing → fallback to 'terraform' or empty
+                tf_code = att.get("tf") or att.get("terraform") or ""
 
-            # Attempt status
-            if success:
-                st.success(f"Attempt #{idx}: SUCCESS at stage `{stage}` 🎉")
-            else:
-                st.error(f"Attempt #{idx}: FAILED at stage `{stage}`")
+                st.markdown(f"---\n## 🩺 Healing Attempt #{idx}")
 
-            st.markdown("### 🧩 Terraform Code Used in This Attempt")
-            with st.expander("Show Terraform (attempt version)", expanded=False):
-                st.code(tf_code, language="hcl")
+                # Attempt status
+                if success:
+                    st.success(f"Attempt #{idx}: SUCCESS at stage `{stage}` 🎉")
+                else:
+                    st.error(f"Attempt #{idx}: FAILED at stage `{stage}`")
 
-            # Logs
-            st.markdown("### 📄 STDOUT")
-            st.code(stdout or "(empty)")
+                # Terraform code used in attempt
+                st.markdown("### 🧩 Terraform Code Used in This Attempt")
+                with st.expander("Show Terraform (attempt version)", expanded=False):
+                    if tf_code.strip():
+                        st.code(tf_code, language="hcl")
+                    else:
+                        st.code("(no terraform code captured for this attempt)")
 
-            if stderr:
-                st.markdown("### ⚠️ STDERR")
-                st.code(stderr)
+                # Logs
+                st.markdown("### 📄 STDOUT")
+                st.code(stdout if stdout.strip() else "(empty)")
 
-            # If failure → show healing context
-            if not success and idx != len(attempts):
-                st.info("Claude attempted to repair the Terraform code for the next retry.")
+                if stderr and stderr.strip():
+                    st.markdown("### ⚠️ STDERR")
+                    st.code(stderr)
+
+                # If failure → show healing context
+                if not success and idx != len(attempts):
+                    st.info("Claude attempted to repair the Terraform code for the next retry.")
 
     st.markdown("---")
