@@ -131,5 +131,5 @@ edges:
     map_result_to: final
 
 limits:
-  max_retries: 3
+  max_retries: 7
   stop_after_success: true
